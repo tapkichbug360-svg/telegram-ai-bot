@@ -1,39 +1,35 @@
 """
 ==============================================
-  TELEGRAM AI BOT - WEB SERVICE (WEBHOOK)
-==============================================
-- Dùng webhook thay vì polling
-- Chạy trên Render Web Service (có gói Free)
+  TELEGRAM AI BOT - RENDER WEBHOOK FIXED
 ==============================================
 """
 
 import os
+import sys
+import time
+import json
 import requests
 import urllib.parse
 import logging
 from io import BytesIO
 from collections import defaultdict
-from pathlib import Path
+from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, Bot
 from telegram.ext import CommandHandler, MessageHandler, filters, ContextTypes
+import asyncio
 
-# ==================== ĐỌC FILE .ENV ====================
-env_path = Path(__file__).parent / ".env"
-TELEGRAM_TOKEN = ""
-OPENROUTER_API_KEY = ""
-
-if env_path.exists():
-    with open(env_path, 'r', encoding='utf-8-sig') as f:
-        for line in f:
-            line = line.strip()
-            if line.startswith("TELEGRAM_BOT_TOKEN="):
-                TELEGRAM_TOKEN = line.split("=", 1)[1].strip()
-            elif line.startswith("OPENROUTER_API_KEY="):
-                OPENROUTER_API_KEY = line.split("=", 1)[1].strip()
+# ==================== ĐỌC BIẾN MÔI TRƯỜNG ====================
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 if not TELEGRAM_TOKEN:
-    raise SystemExit("❌ Thiếu TELEGRAM_BOT_TOKEN trong file .env")
+    print("❌ Thiếu TELEGRAM_BOT_TOKEN")
+    sys.exit(1)
+
+print(f"✅ Bot token: {TELEGRAM_TOKEN[:20]}...")
+if OPENROUTER_API_KEY:
+    print(f"✅ OpenRouter key: {OPENROUTER_API_KEY[:20]}...")
 
 # ==================== CẤU HÌNH ====================
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -99,82 +95,84 @@ def generate_image(prompt: str) -> bytes:
     with urllib.request.urlopen(req, timeout=60) as response:
         return response.read()
 
-# ==================== XỬ LÝ UPDATE ====================
-async def handle_update(update: Update):
-    """Xử lý update từ Telegram"""
-    if not update.message:
-        return
-    
-    chat_id = update.message.chat.id
-    user_text = update.message.text.strip() if update.message.text else ""
-    
-    if not user_text:
-        return
-    
-    # Xử lý lệnh /hoi
-    if user_text.startswith('/hoi'):
-        # Lấy nội dung sau lệnh /hoi
-        parts = user_text.split(maxsplit=1)
-        if len(parts) < 2:
-            await bot.send_message(chat_id=chat_id, text="💬 Cách dùng: `/hoi câu hỏi của bạn`", parse_mode='Markdown')
+# ==================== XỬ LÝ UPDATE (SYNC) ====================
+def handle_update_sync(update_data):
+    """Xử lý update đồng bộ - tránh lỗi event loop"""
+    try:
+        update = Update.de_json(update_data, bot)
+        
+        if not update or not update.message:
             return
-        question = parts[1]
         
-        await bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = ask_ai(chat_id, question)
+        chat_id = update.message.chat.id
+        user_text = update.message.text.strip() if update.message.text else ""
         
-        # Lưu lịch sử
-        chat_histories[chat_id].append(f"User: {question}")
-        chat_histories[chat_id].append(f"Bot: {reply}")
-        
-        if len(chat_histories[chat_id]) > 30:
-            chat_histories[chat_id] = chat_histories[chat_id][-30:]
-        
-        await bot.send_message(chat_id=chat_id, text=reply)
-        return
-    
-    # Xử lý lệnh /ve
-    if user_text.startswith('/ve'):
-        parts = user_text.split(maxsplit=1)
-        if len(parts) < 2:
-            await bot.send_message(chat_id=chat_id, text="🎨 Cách dùng: `/ve mô tả ảnh`", parse_mode='Markdown')
+        if not user_text:
             return
-        prompt = parts[1]
         
-        await bot.send_chat_action(chat_id=chat_id, action="upload_photo")
-        try:
-            img_bytes = generate_image(prompt)
-            await bot.send_photo(
+        # Lệnh /hoi
+        if user_text.startswith('/hoi'):
+            parts = user_text.split(maxsplit=1)
+            if len(parts) < 2:
+                bot.send_message(chat_id=chat_id, text="💬 Cách dùng: `/hoi câu hỏi`", parse_mode='Markdown')
+                return
+            question = parts[1]
+            
+            reply = ask_ai(chat_id, question)
+            
+            chat_histories[chat_id].append(f"User: {question}")
+            chat_histories[chat_id].append(f"Bot: {reply}")
+            
+            if len(chat_histories[chat_id]) > 30:
+                chat_histories[chat_id] = chat_histories[chat_id][-30:]
+            
+            bot.send_message(chat_id=chat_id, text=reply)
+            return
+        
+        # Lệnh /ve
+        if user_text.startswith('/ve'):
+            parts = user_text.split(maxsplit=1)
+            if len(parts) < 2:
+                bot.send_message(chat_id=chat_id, text="🎨 Cách dùng: `/ve mô tả ảnh`", parse_mode='Markdown')
+                return
+            prompt = parts[1]
+            
+            try:
+                img_bytes = generate_image(prompt)
+                bot.send_photo(
+                    chat_id=chat_id,
+                    photo=img_bytes,
+                    caption=f'🎨 *{prompt[:50]}*',
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                bot.send_message(chat_id=chat_id, text=f"⚠️ Lỗi tạo ảnh: {e}")
+            return
+        
+        # Lệnh /reset
+        if user_text.startswith('/reset'):
+            chat_histories[chat_id] = []
+            bot.send_message(chat_id=chat_id, text="🗑️ Đã xóa lịch sử!")
+            return
+        
+        # Lệnh /start
+        if user_text.startswith('/start'):
+            bot.send_message(
                 chat_id=chat_id,
-                photo=BytesIO(img_bytes),
-                caption=f'🎨 *{prompt[:50]}*',
+                text="🤖 *Bot AI - Miễn Phí 100%*\n\n"
+                     "✨ *Tính năng:*\n"
+                     "• 💬 `/hoi câu hỏi` - Hỏi AI\n"
+                     "• 🎨 `/ve mô tả` - Tạo ảnh\n"
+                     "• 🔄 `/reset` - Xóa lịch sử\n\n"
+                     "💡 *Ví dụ:*\n"
+                     "• `/hoi 1+1 bằng mấy?`\n"
+                     "• `/ve con mèo dễ thương`",
                 parse_mode='Markdown'
             )
-        except Exception as e:
-            await bot.send_message(chat_id=chat_id, text=f"⚠️ Lỗi tạo ảnh: {e}")
-        return
-    
-    # Xử lý lệnh /reset
-    if user_text.startswith('/reset'):
-        chat_histories[chat_id] = []
-        await bot.send_message(chat_id=chat_id, text="🗑️ Đã xóa lịch sử trò chuyện!")
-        return
-    
-    # Xử lý lệnh /start
-    if user_text.startswith('/start'):
-        await bot.send_message(
-            chat_id=chat_id,
-            text="🤖 *Bot AI - Miễn Phí 100%*\n\n"
-                 "✨ *Tính năng:*\n"
-                 "• 💬 `/hoi câu hỏi` - Hỏi AI\n"
-                 "• 🎨 `/ve mô tả` - Tạo ảnh\n"
-                 "• 🔄 `/reset` - Xóa lịch sử\n\n"
-                 "💡 *Ví dụ:*\n"
-                 "• `/hoi 1+1 bằng mấy?`\n"
-                 "• `/ve con mèo dễ thương`",
-            parse_mode='Markdown'
-        )
-        return
+            return
+            
+    except Exception as e:
+        logger.error(f"Xử lý update lỗi: {e}")
 
 # ==================== FLASK WEBHOOK ====================
 app = Flask(__name__)
@@ -186,9 +184,9 @@ def home():
 @app.route(f'/webhook/{TELEGRAM_TOKEN}', methods=['POST'])
 def webhook():
     try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        import asyncio
-        asyncio.run(handle_update(update))
+        update_data = request.get_json(force=True)
+        # Xử lý đồng bộ, không dùng asyncio
+        handle_update_sync(update_data)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -196,21 +194,10 @@ def webhook():
 
 # ==================== KHỞI ĐỘNG ====================
 if __name__ == "__main__":
-    # Set webhook
     port = int(os.environ.get("PORT", 10000))
-    # Lấy URL từ Render (Render tự động set biến RENDER_EXTERNAL_HOSTNAME)
-    render_hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
-    
-    if render_hostname:
-        webhook_url = f"https://{render_hostname}/webhook/{TELEGRAM_TOKEN}"
-    else:
-        # Chạy local
-        webhook_url = f"https://localhost/webhook/{TELEGRAM_TOKEN}"
-    
     print(f"\n{'='*50}")
-    print(f"🚀 Bot đang chạy Web Service mode!")
-    print(f"🔗 Webhook URL: {webhook_url}")
+    print(f"🚀 Bot đang chạy Webhook mode!")
+    print(f"📱 Telegram Bot: @Dengoancualam05_bot")
     print(f"{'='*50}\n")
     
-    # Chạy Flask
     app.run(host="0.0.0.0", port=port)
